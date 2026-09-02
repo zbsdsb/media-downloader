@@ -30,7 +30,7 @@
         <header class="text-center mb-5">
             <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-500/10 border border-sky-500/20 text-sky-400 text-xs font-semibold mb-2">
                 <span class="w-2 h-2 rounded-full bg-sky-400 animate-pulse"></span>
-                <span>Pro 4K / 原画最高码率 · 全平台适配</span>
+                <span>Pro 4K / 原画最高码率 · 流式直播防盗链</span>
             </div>
             <h1 class="text-2xl sm:text-3xl font-extrabold tracking-tight bg-gradient-to-r from-sky-400 via-indigo-300 to-purple-400 bg-clip-text text-transparent">
                 抖音 & Instagram 媒体解析
@@ -118,7 +118,7 @@
             </div>
             
             <p class="text-xs text-slate-300 leading-relaxed">
-                手机浏览器受苹果权限限制无法静默写入相册，但「快捷指令」具有系统原生权限，可实现<b>完全无感将 17 张原图全自动存入相册</b>！
+                在 iPhone「快捷指令」配置后，分享面板一键运行，后台自动将所有原图<b>直接存入 iPhone 相册</b>，不需要浏览器弹窗确认。
             </p>
 
             <div class="bg-slate-900/90 rounded-2xl p-3 border border-slate-700/80 space-y-2 text-xs">
@@ -232,82 +232,6 @@
             }
         }
 
-        // 电脑端/全平台逐张批量直下函数
-        async function downloadAllSequential() {
-            if (!currentData || !currentData.medias || currentData.medias.length === 0) return;
-            var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-            var total = currentData.medias.length;
-
-            if (isMobile) {
-                // 移动端如果是本地 HTTP 访问，提示用户使用打包下载或长按存图
-                var proceed = confirm("手机浏览器会对每张图弹窗询问下载。\n\n推荐：点击旁边的「打包下载原图 (ZIP)」只弹 1 次确认最方便！\n\n是否仍尝试逐张下载？");
-                if (!proceed) return;
-            }
-
-            var btn = document.getElementById("batchDownloadBtn");
-            var originalText = btn.innerHTML;
-            btn.disabled = true;
-
-            for (var i = 0; i < total; i++) {
-                btn.innerHTML = "正在下载 (" + (i + 1) + "/" + total + ")...";
-                var item = currentData.medias[i];
-                var a = document.createElement("a");
-                a.href = item.download_url;
-                a.download = (currentData.title || "image") + "_图" + (i + 1) + ".jpg";
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                await new Promise(function(r) { setTimeout(r, 800); });
-            }
-
-            btn.innerHTML = "✓ 全部下载完成 (" + total + "张)";
-            setTimeout(function() {
-                btn.innerHTML = originalText;
-                btn.disabled = false;
-            }, 3000);
-        }
-
-        // 尝试唤起原生相册共享（仅在 HTTPS 安全上下文下生效）
-        async function tryShareToPhotos() {
-            if (!currentData || !currentData.medias || currentData.medias.length === 0) return;
-            var btn = document.getElementById("sharePhotosBtn");
-            var originalText = btn.innerHTML;
-            btn.innerHTML = "⏳ 正在准备原图...";
-            btn.disabled = true;
-
-            try {
-                var files = [];
-                var total = currentData.medias.length;
-                for (var i = 0; i < total; i++) {
-                    btn.innerHTML = "准备中 (" + (i + 1) + "/" + total + ")...";
-                    var item = currentData.medias[i];
-                    var blobResp = await fetch(item.download_url);
-                    var blob = await blobResp.blob();
-                    var file = new File([blob], (currentData.title || "image") + "_图" + (i + 1) + ".jpg", { type: "image/jpeg" });
-                    files.push(file);
-                }
-
-                if (navigator.canShare && navigator.canShare({ files: files })) {
-                    await navigator.share({
-                        files: files,
-                        title: currentData.title || "无水印高清图集"
-                    });
-                    btn.innerHTML = "✓ 已存入相册";
-                } else {
-                    alert("因为当前是内网 HTTP 访问（非 HTTPS 域名），浏览器出于安全策略关闭了原生相册直写权限。\n\n手机上请使用「打包下载 (ZIP)」或「iOS 快捷指令」一键直存相册！");
-                }
-            } catch (err) {
-                if (err.name !== "AbortError") {
-                    alert("当前环境无法直接写入相册，建议使用「打包下载 (ZIP)」或「iOS 快捷指令」！");
-                }
-            } finally {
-                setTimeout(function() {
-                    btn.innerHTML = originalText;
-                    btn.disabled = false;
-                }, 3000);
-            }
-        }
-
         function renderCard(data) {
             document.getElementById("resPlatformBadge").innerText = data.platform || "视频";
             document.getElementById("resAuthor").innerText = data.author || "创作者";
@@ -322,6 +246,7 @@
 
             if (data.type === "video") {
                 var media = data.medias[0];
+                var videoSrc = media.stream_url || media.download_url || media.raw_url;
                 var bgmHtml = "";
                 if (data.music && data.music.download_url) {
                     bgmHtml = "<a href=\"" + data.music.download_url + "\" class=\"col-span-2 bg-slate-800/80 hover:bg-slate-700 text-slate-300 font-medium py-2.5 px-3 rounded-xl text-center text-xs border border-slate-700 transition flex items-center justify-center gap-1.5\">" +
@@ -330,7 +255,7 @@
 
                 container.innerHTML = "<div class=\"space-y-3\">" +
                     "<div class=\"relative rounded-2xl overflow-hidden bg-black shadow-inner border border-slate-700 aspect-video flex items-center justify-center\">" +
-                    "<video src=\"" + media.raw_url + "\" controls playsinline poster=\"" + data.cover + "\" class=\"w-full h-full object-contain max-h-[360px]\"></video>" +
+                    "<video src=\"" + videoSrc + "\" controls playsinline preload=\"auto\" poster=\"" + data.cover + "\" class=\"w-full h-full object-contain max-h-[360px]\"></video>" +
                     "</div>" +
                     "<div class=\"grid grid-cols-2 gap-2 pt-1\">" +
                     "<a href=\"" + media.download_url + "\" class=\"col-span-2 sm:col-span-1 bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-semibold py-3 px-4 rounded-xl text-center text-xs sm:text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20\">" +
@@ -342,16 +267,12 @@
             } else {
                 // 图文 / 多图展示
                 var count = data.count || data.medias.length;
-                var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
                 
                 var zipBtnHtml = "";
                 if (data.zip_download_url) {
-                    zipBtnHtml = "<a href=\"" + data.zip_download_url + "\" class=\"flex-1 bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-md transition text-center flex items-center justify-center gap-1.5\">" +
-                        "<span>📦 打包下载原图 (ZIP)</span></a>";
+                    zipBtnHtml = "<a href=\"" + data.zip_download_url + "\" class=\"w-full bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-md transition text-center flex items-center justify-center gap-1.5\">" +
+                        "<span>📦 打包下载全部原图 (ZIP)</span></a>";
                 }
-
-                var batchBtnHtml = "<button type=\"button\" onclick=\"downloadAllSequential()\" id=\"batchDownloadBtn\" class=\"flex-1 bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white text-xs font-semibold py-2.5 px-3 rounded-xl shadow-md transition text-center flex items-center justify-center gap-1.5 cursor-pointer\">" +
-                    "<span>⬇️ 全部逐张下载 (" + count + "张)</span></button>";
 
                 var bgmHtml = "";
                 if (data.music && data.music.download_url) {
@@ -364,11 +285,10 @@
                     "<span>共发现 <b class=\"text-sky-400\">" + count + "</b> 张高清无损原图</span>" +
                     "<span class=\"text-[11px] text-slate-400\">点图放大长按可存相册</span>" +
                     "</div>" +
-                    "<div class=\"flex flex-col sm:flex-row gap-2\">" + zipBtnHtml + batchBtnHtml + "</div>" +
+                    zipBtnHtml +
                     bgmHtml +
                     "<div class=\"grid grid-cols-2 gap-3 pt-1\">";
 
-                // 每个卡片使用固定的 9:16 壁纸黄金比例统一高度，整齐划一
                 data.medias.forEach(function(m, i) {
                     gridHtml += "<div class=\"rounded-2xl overflow-hidden bg-slate-900 border border-slate-700/80 shadow-md flex flex-col justify-between\">" +
                         "<div class=\"w-full aspect-[9/16] bg-slate-950 flex items-center justify-center overflow-hidden cursor-zoom-in relative group\" onclick=\"openPreview('" + m.raw_url + "')\">" +
@@ -378,7 +298,7 @@
                         "<div class=\"p-2 bg-slate-900 border-t border-slate-800/80 flex items-center justify-between gap-1\">" +
                         "<span class=\"text-[11px] font-semibold text-slate-400 pl-1\">原画无损</span>" +
                         "<a href=\"" + m.download_url + "\" class=\"bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-medium px-3 py-1 rounded-lg transition shadow-sm flex items-center gap-1\">" +
-                        "<span>下载</span></a>" +
+                        "<span>保存</span></a>" +
                         "</div></div>";
                 });
                 gridHtml += "</div></div>";

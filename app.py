@@ -18,7 +18,7 @@ import yt_dlp
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-app = FastAPI(title="Pro Media Downloader API", version="1.1.0")
+app = FastAPI(title="Pro Media Downloader API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -132,10 +132,12 @@ async def extract_douyin(raw_input: str, base_url: str):
                 if url_list:
                     raw_img_url = url_list[0]
                     proxy_dl = f"{base_url}api/download?media_url={urllib.parse.quote(raw_img_url)}&filename={urllib.parse.quote(clean_title + f'_图{idx+1}')}"
+                    proxy_stream = f"{base_url}api/stream?media_url={urllib.parse.quote(raw_img_url)}"
                     medias.append({
                         "index": idx + 1,
                         "type": "image",
                         "raw_url": raw_img_url,
+                        "stream_url": proxy_stream,
                         "download_url": proxy_dl,
                         "quality": "原始无损图"
                     })
@@ -184,6 +186,7 @@ async def extract_douyin(raw_input: str, base_url: str):
                 raise HTTPException(status_code=400, detail="未找到无水印视频直链")
 
             proxy_dl = f"{base_url}api/download?media_url={urllib.parse.quote(best_video_url)}&filename={urllib.parse.quote(clean_title)}"
+            proxy_stream = f"{base_url}api/stream?media_url={urllib.parse.quote(best_video_url)}"
 
             return {
                 "platform": "抖音视频",
@@ -199,6 +202,7 @@ async def extract_douyin(raw_input: str, base_url: str):
                     "index": 1,
                     "type": "video",
                     "raw_url": best_video_url,
+                    "stream_url": proxy_stream,
                     "download_url": proxy_dl,
                     "quality": quality_label
                 }]
@@ -240,10 +244,12 @@ def extract_instagram(raw_input: str, base_url: str):
                         is_vid = entry.get('ext') == 'mp4' or 'video' in entry.get('extractor_key', '').lower()
                         m_type = "video" if is_vid else "image"
                         proxy_dl = f"{base_url}api/download?media_url={urllib.parse.quote(m_url)}&filename={urllib.parse.quote(clean_title + f'_item{idx+1}')}"
+                        proxy_stream = f"{base_url}api/stream?media_url={urllib.parse.quote(m_url)}"
                         medias.append({
                             "index": idx + 1,
                             "type": m_type,
                             "raw_url": m_url,
+                            "stream_url": proxy_stream,
                             "download_url": proxy_dl,
                             "quality": "原片最高画质"
                         })
@@ -268,6 +274,7 @@ def extract_instagram(raw_input: str, base_url: str):
 
             is_video = info.get('ext') == 'mp4' or 'video' in info.get('extractor_key', '').lower() or info.get('vcodec') != 'none'
             proxy_dl = f"{base_url}api/download?media_url={urllib.parse.quote(video_url)}&filename={urllib.parse.quote(clean_title)}"
+            proxy_stream = f"{base_url}api/stream?media_url={urllib.parse.quote(video_url)}"
 
             return {
                 "platform": "Instagram",
@@ -282,6 +289,7 @@ def extract_instagram(raw_input: str, base_url: str):
                     "index": 1,
                     "type": "video" if is_video else "image",
                     "raw_url": video_url,
+                    "stream_url": proxy_stream,
                     "download_url": proxy_dl,
                     "quality": "原画最高分辨率"
                 }]
@@ -332,6 +340,53 @@ async def api_shortcut(req: ShortcutRequest, request: Request):
         "download_urls": download_urls,
         "raw_urls": raw_urls
     }
+
+# 高性能防盗链视频/图片流媒体代理（支持 Range 拖拽进度条）
+@app.get("/api/stream")
+async def api_stream(request: Request, media_url: str = Query(...)):
+    is_douyin = "douyin" in media_url or "byte" in media_url
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Referer": "https://www.douyin.com/" if is_douyin else "https://www.instagram.com/"
+    }
+    
+    range_header = request.headers.get("range")
+    if range_header:
+        req_headers["Range"] = range_header
+
+    client = httpx.AsyncClient(trust_env=False, timeout=30.0, follow_redirects=True)
+    req = client.build_request("GET", media_url, headers=req_headers)
+    resp = await client.send(req, stream=True)
+
+    if resp.status_code not in (200, 206):
+        await resp.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=resp.status_code, detail="无法读取远程视频流")
+
+    async def stream_content():
+        try:
+            async for chunk in resp.aiter_bytes(chunk_size=1024 * 128):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    res_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": resp.headers.get("content-type", "video/mp4"),
+        "Cache-Control": "public, max-age=3600",
+        "Access-Control-Allow-Origin": "*"
+    }
+    if "content-range" in resp.headers:
+        res_headers["Content-Range"] = resp.headers["content-range"]
+    if "content-length" in resp.headers:
+        res_headers["Content-Length"] = resp.headers["content-length"]
+
+    return StreamingResponse(
+        stream_content(),
+        status_code=resp.status_code,
+        headers=res_headers
+    )
 
 # 图文一键打包 ZIP 下载接口
 @app.get("/api/download_zip")

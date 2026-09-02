@@ -1,0 +1,9 @@
+services:
+  media-downloader:
+    build: .
+    container_name: media-downloader
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PROXY_URL= # 如果服务器在国内且需要解析 Ins，可填入如 http://192.168.1.x:7890，海外 VPS 留空即可

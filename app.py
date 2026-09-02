@@ -28,16 +28,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PROXY_URL = os.getenv("PROXY_URL") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
+PROXY_URL = os.getenv("PROXY_URL") or None
 
 def random_str(length=16):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 async def fetch_douyin_data(item_id: str, max_retries: int = 3):
-    """带自动注册 ttwid 与动态凭据的抖音详情抓取器"""
+    """带自动注册 ttwid 与动态凭据的抖音详情抓取器（强制直连 trust_env=False）"""
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+            async with httpx.AsyncClient(trust_env=False, follow_redirects=True, timeout=10.0) as client:
                 reg_resp = await client.post('https://ttwid.bytedance.com/ttwid/union/register/', json={
                     'region': 'cn', 'aid': 1768, 'needFid': 'false', 'service': 'www.ixigua.com',
                     'migrate_info': {'ticket': '', 'source': 'node'}, 'cbUrlProtocol': 'https', 'union': 'true'
@@ -85,7 +85,7 @@ async def extract_douyin(raw_input: str, base_url: str):
     
     share_url = url_match.group(0)
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+    async with httpx.AsyncClient(trust_env=False, follow_redirects=True, timeout=12.0) as client:
         resp = await client.get(share_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
         final_url = str(resp.url)
 
@@ -140,7 +140,6 @@ async def extract_douyin(raw_input: str, base_url: str):
                         "quality": "原始无损图"
                     })
 
-            # 生成一键打包 ZIP 链接
             encoded_title = urllib.parse.quote(clean_title)
             zip_url = f"{base_url}api/download_zip?item_id={item_id}&filename={encoded_title}"
 
@@ -230,7 +229,6 @@ def extract_instagram(raw_input: str, base_url: str):
             author = info.get('uploader') or info.get('channel') or "Instagram User"
             cover = info.get('thumbnail', '')
 
-            # 轮播多媒体 (Carousel)
             if 'entries' in info and info['entries']:
                 medias = []
                 for idx, entry in enumerate(info['entries']):
@@ -261,7 +259,6 @@ def extract_instagram(raw_input: str, base_url: str):
                     "medias": medias
                 }
             
-            # 单作品 (Video / Photo)
             video_url = info.get('url')
             if not video_url and info.get('formats'):
                 video_url = info['formats'][-1].get('url')
@@ -350,7 +347,7 @@ async def api_download_zip(item_id: str = Query(...), filename: str = Query("ima
     }
 
     zip_buffer = io.BytesIO()
-    async with httpx.AsyncClient(headers=headers, timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(trust_env=False, headers=headers, timeout=30.0, follow_redirects=True) as client:
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for idx, img in enumerate(images):
                 url_list = img.get("url_list", [])
@@ -378,7 +375,7 @@ async def api_download(media_url: str = Query(...), filename: str = Query("media
         "Referer": "https://www.douyin.com/" if is_douyin else "https://www.instagram.com/"
     }
 
-    client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+    client = httpx.AsyncClient(trust_env=False, timeout=60.0, follow_redirects=True)
     req = client.build_request("GET", media_url, headers=headers)
     resp = await client.send(req, stream=True)
 

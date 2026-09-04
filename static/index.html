@@ -1,6 +1,23 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <!-- 站点图标与缩略图 (Favicon & Touch Icon & OpenGraph) -->
+    <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+    <link rel="shortcut icon" href="/favicon.ico">
+    
+    <meta name="description" content="抖音 60FPS 原画视频、高清多图集与 Instagram 无水印一键提取">
+    <meta name="theme-color" content="#090D16">
+    
+    <!-- 社交分享卡片 (WeChat / iMessage / Twitter / Telegram) -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://media.zbsnb.dpdns.org">
+    <meta property="og:title" content="无水印极速媒体解析站">
+    <meta property="og:description" content="支持抖音 60FPS 原画视频、高清多图集与 Instagram 原图原片直下">
+    <meta property="og:image" content="https://media.zbsnb.dpdns.org/static/og-image.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:image" content="https://media.zbsnb.dpdns.org/static/og-image.png">
+
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>无水印极速媒体下载站</title>
@@ -32,9 +49,9 @@
                 <span class="w-2 h-2 rounded-full bg-sky-400 animate-pulse"></span>
                 <span>Pro 4K / 原画最高码率 · 流式直播防盗链</span>
             </div>
-            <h1 class="text-2xl sm:text-3xl font-extrabold tracking-tight bg-gradient-to-r from-sky-400 via-indigo-300 to-purple-400 bg-clip-text text-transparent">
+            <div class="flex items-center justify-center gap-3 mb-1"><img src="/static/favicon.png" alt="logo" class="w-8 h-8 rounded-xl shadow-md border border-sky-400/30" /><h1 class="text-2xl sm:text-3xl font-extrabold tracking-tight bg-gradient-to-r from-sky-400 via-indigo-300 to-purple-400 bg-clip-text text-transparent m-0">
                 抖音 & Instagram 媒体解析
-            </h1>
+            </h1></div>
             <p class="text-xs text-slate-400 mt-1.5">无水印视频 · 原图高清图集 · Reels 及背景原声</p>
         </header>
 
@@ -106,8 +123,8 @@
     </main>
 
     <!-- iOS 快捷指令配置弹窗 -->
-    <div id="shortcutModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-        <div class="glass-panel max-w-md w-full rounded-3xl p-5 shadow-2xl space-y-3.5 border border-slate-700">
+    <div id="shortcutModal" style="position:fixed;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;z-index:9999;" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm p-4">
+        <div style="max-width:480px;width:92%;margin:auto;box-sizing:border-box;" class="glass-panel max-w-md w-full rounded-3xl p-6 shadow-2xl space-y-4 border border-slate-700">
             <div class="flex items-center justify-between">
                 <h3 class="text-base font-bold text-slate-100 flex items-center gap-2">
                     ⚡ iOS 快捷指令直存相册配置

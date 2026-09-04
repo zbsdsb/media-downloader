@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import io
 import time
@@ -476,9 +476,24 @@ async def api_download(media_url: str = Query(...), filename: str = Query("media
 if os.path.exists(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    fav_p = os.path.join(STATIC_DIR, 'favicon.png')
+    if os.path.exists(fav_p):
+        return FileResponse(fav_p, media_type='image/png')
+    raise HTTPException(status_code=404)
+
+@app.get('/apple-touch-icon.png', include_in_schema=False)
+async def apple_touch_icon():
+    icon_p = os.path.join(STATIC_DIR, 'apple-touch-icon.png')
+    if os.path.exists(icon_p):
+        return FileResponse(icon_p, media_type='image/png')
+    raise HTTPException(status_code=404)
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     index_path = os.path.join(STATIC_DIR, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return HTMLResponse("<h1>Media Downloader API is Running</h1>")
+

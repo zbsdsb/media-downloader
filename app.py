@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import io
 import time
@@ -70,6 +70,12 @@ async def fetch_douyin_data(item_id: str, max_retries: int = 3):
         time.sleep(0.3)
     return None
 
+def get_clean_base_url(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    if "zbsnb.dpdns.org" in host or proto == "https":
+        proto = "https"
+    return f"{proto}://{host}/"
 class ParseRequest(BaseModel):
     url: str
 
@@ -304,7 +310,7 @@ def extract_instagram(raw_input: str, base_url: str):
 @app.post("/api/parse")
 async def api_parse(req: ParseRequest, request: Request):
     raw_url = req.url.strip()
-    base_url = str(request.base_url)
+    base_url = get_clean_base_url(request)
     if "douyin.com" in raw_url or "v.douyin.com" in raw_url:
         return await extract_douyin(raw_url, base_url)
     elif "instagram.com" in raw_url:
@@ -318,7 +324,7 @@ async def api_shortcut(req: ShortcutRequest, request: Request):
     if not raw_text:
         raise HTTPException(status_code=400, detail="请求内容为空")
 
-    base_url = str(request.base_url)
+    base_url = get_clean_base_url(request)
     if "douyin.com" in raw_text or "v.douyin.com" in raw_text:
         res = await extract_douyin(raw_text, base_url)
     elif "instagram.com" in raw_text:

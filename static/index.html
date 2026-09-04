@@ -126,7 +126,7 @@
     </main>
 
     <!-- iOS 快捷指令配置弹窗 -->
-    <div id="shortcutModal" style="position:fixed;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;z-index:9999;" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm p-4">
+    <div id="shortcutModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;align-items:center;justify-content:center;background:rgba(0,0,0,0.85);backdrop-filter:blur(16px);padding:16px;" onclick="handleOverlayClick(event)">
         <div style="max-width:480px;width:92%;margin:auto;box-sizing:border-box;" class="glass-panel max-w-md w-full rounded-3xl p-6 shadow-2xl space-y-4 border border-slate-700">
             <div class="flex items-center justify-between">
                 <h3 class="text-base font-bold text-slate-100 flex items-center gap-2">
@@ -160,7 +160,7 @@
     </div>
 
     <!-- 预览大图弹窗 (Lightbox) -->
-    <div id="previewModal" class="hidden fixed inset-0 z-50 bg-black/95 backdrop-blur-md flex flex-col items-center justify-center p-4" onclick="closePreview()">
+    <div id="previewModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;align-items:center;justify-content:center;background:rgba(0,0,0,0.95);backdrop-filter:blur(16px);padding:16px;flex-direction:column;" onclick="closePreview()">
         <div class="relative max-w-full max-h-[85vh] flex items-center justify-center">
             <img id="previewImg" class="max-w-full max-h-[82vh] rounded-2xl object-contain shadow-2xl" src="" alt="preview" />
         </div>
@@ -202,25 +202,27 @@
             navigator.clipboard.writeText(title).then(function() { alert("文案已复制！"); });
         }
 
-        function toggleShortcutModal() {
+                function toggleShortcutModal() {
             var modal = document.getElementById("shortcutModal");
-            modal.classList.toggle("hidden");
-            document.getElementById("apiEndpoint").innerText = window.location.origin + "/api/shortcut";
+            if (modal.style.display === "flex") {
+                modal.style.display = "none";
+            } else {
+                modal.style.display = "flex";
+                document.getElementById("apiEndpoint").innerText = window.location.origin + "/api/shortcut";
+            }
         }
-
-        function copyEndpoint() {
-            var ep = window.location.origin + "/api/shortcut";
-            navigator.clipboard.writeText(ep).then(function() { alert("API 端点已复制！"); });
+        function handleOverlayClick(event) {
+            if (event.target.id === "shortcutModal") {
+                toggleShortcutModal();
+            }
         }
-
         function openPreview(url) {
             var m = document.getElementById("previewModal");
             document.getElementById("previewImg").src = url;
-            m.classList.remove("hidden");
+            m.style.display = "flex";
         }
-
         function closePreview() {
-            document.getElementById("previewModal").classList.add("hidden");
+            document.getElementById("previewModal").style.display = "none";
         }
 
         async function parseContent() {
@@ -336,5 +338,7 @@
     </script>
 </body>
 </html>
+
+
 
 

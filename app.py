@@ -60,6 +60,14 @@ PROXY_URL = os.getenv("PROXY_URL") or None
 #   想压体积可设 LIVE_JPEG_QUALITY=85（约省一半，画质肉眼看不出差别）。
 LIVE_JPEG_QUALITY = int(os.getenv("LIVE_JPEG_QUALITY", "98"))
 
+# 实况声音：抖音不再提供实况片段原声（实测 5 个作品的实况段音轨全为零值，
+# 唯一声源是尾卡广告），因此默认把**帖子 BGM** 混入实况片段，避免默片感。
+#   bgm（默认）取 aweme_detail.music.play_url 的前 N 秒作音轨，视频流 -c:v copy 不重编码
+#   off 保留抖音原样（静音）
+LIVE_AUDIO_MODE = (os.getenv("LIVE_AUDIO_MODE", "bgm") or "bgm").strip().lower()
+# BGM 音量比例（1.0 = 原音量）
+LIVE_BGM_VOLUME = float(os.getenv("LIVE_BGM_VOLUME", "1.0"))
+
 def random_str(length=16):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
@@ -128,6 +136,25 @@ def get_clean_base_url(request: Request) -> str:
     if "zbsnb.dpdns.org" in host or proto == "https":
         proto = "https"
     return f"{proto}://{host}/"
+
+
+def media_duration(ffmpeg_exe: str, path: str) -> float:
+    """用 ffmpeg 读容器时长（imageio-ffmpeg 只带 ffmpeg，不带 ffprobe）。
+
+    不能信 aweme_detail 里声明的 duration：实测声明 1500ms 而实际视频流 1400ms，
+    按声明的切 BGM 会留下 0.1s 悬空音轨。
+    """
+    try:
+        p = subprocess.run([ffmpeg_exe, "-hide_banner", "-i", path],
+                           capture_output=True, text=True, timeout=30)
+        for line in p.stderr.splitlines():
+            if "Duration:" in line:
+                t = line.split("Duration:")[1].split(",")[0].strip()
+                h, m, s = t.split(":")
+                return int(h) * 3600 + int(m) * 60 + float(s)
+    except Exception:
+        pass
+    return 0.0
 class ParseRequest(BaseModel):
     url: str
 
@@ -190,6 +217,8 @@ async def extract_douyin(raw_input: str, base_url: str):
                 "title": music_title,
                 "author": music_info.get("author", ""),
                 "raw_url": music_urls[0],
+                "url": music_urls[0],
+                "duration_ms": music_info.get("duration") or music_info.get("audition_duration"),
                 "download_url": music_dl
             }
 
@@ -226,6 +255,7 @@ async def extract_douyin(raw_input: str, base_url: str):
                     "raw_url": raw_img_url,
                     "stream_url": proxy_stream,
                     "download_url": proxy_dl,
+                    "duration_ms": (iv.get("duration") or ((iv.get("play_addr") or {}).get("duration"))) if is_live_img else None,
                     "quality": "实况照片(图片+视频)" if is_live_img else "原始无损图"
                 }
                 if is_live_img and raw_video_url:
@@ -712,19 +742,49 @@ async def api_live_photo_bundle(url: str = Query(...), index: int = Query(1), re
         with open(raw_vid_path, "wb") as f:
             f.write(vid_resp.content)
 
-        # 1. ffmpeg 只负责无损转封装为 QuickTime MOV（moov 放在文件末尾）
+        # 1. ffmpeg 无损转封装为 QuickTime MOV（moov 放文件末尾），并可选混入帖子 BGM。
         #    Apple 实况必需的 mdta content.identifier 与 mebx timed metadata 轨道
-        #    由 inject_live_photo_metadata 直接写入，不再用 ffmpeg -metadata。
+        #    由 inject_live_photo_metadata 直接写入，不用 ffmpeg -metadata。
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         remux_path = os.path.join(temp_dir, "remux.mov")
-        cmd = [
-            ffmpeg_exe, "-y", "-i", raw_vid_path,
-            "-c", "copy",
-            "-map_metadata", "-1",
-            "-f", "mov",
-            "-brand", "qt",
-            remux_path,
-        ]
+        # 注意：不要在这里写 -c copy，它会被当成下一个输入的输入选项（Unknown decoder 'copy'）
+        cmd = [ffmpeg_exe, "-y", "-i", raw_vid_path]
+
+        # 实况原声缺失（抖音把实况段音轨置全零）→ 用帖子 BGM 补上；视频流仍 copy，不重编码
+        bgm_path = None
+        if LIVE_AUDIO_MODE == "bgm":
+            bgm_url = (((res.get("music") or {}).get("url")) or "").strip()
+            if bgm_url:
+                try:
+                    async with httpx.AsyncClient(trust_env=False, timeout=30.0, follow_redirects=True) as mc:
+                        bgm_resp = await mc.get(bgm_url, headers=headers)
+                    if bgm_resp.status_code == 200 and bgm_resp.content:
+                        bgm_path = os.path.join(temp_dir, "bgm.src")
+                        with open(bgm_path, "wb") as bf:
+                            bf.write(bgm_resp.content)
+                except Exception as exc:
+                    print(f"[live_photo] BGM 下载失败，回退静音: {type(exc).__name__}: {exc}", flush=True)
+                    bgm_path = None
+
+        if bgm_path:
+            # 切 BGM 前 clip 秒作音轨；必须写 -t，否则视频结束后 BGM 会无限流下去
+            clip = media_duration(ffmpeg_exe, raw_vid_path)
+            if clip <= 0:
+                clip = float(target.get("duration_ms") or 0) / 1000.0 or 3.0
+            fade_st = max(0.0, clip - 0.12)
+            cmd += [
+                "-i", bgm_path,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "44100",
+                "-af", (f"volume={LIVE_BGM_VOLUME},afade=t=in:st=0:d=0.08,"
+                        f"afade=t=out:st={fade_st:.3f}:d=0.12"),
+                "-t", f"{clip:.3f}",
+                "-shortest",
+            ]
+        else:
+            cmd += ["-c", "copy", "-map", "0"]
+
+        cmd += ["-map_metadata", "-1", "-f", "mov", "-brand", "qt", remux_path]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         patched_mov = inject_live_photo_metadata(open(remux_path, "rb").read(), asset_id)
         with open(out_mov_path, "wb") as mf:

@@ -2,10 +2,13 @@ import os
 import re
 import io
 import time
+import asyncio
 import zipfile
 import random
 import string
 import urllib.parse
+from contextlib import asynccontextmanager
+from collections import OrderedDict
 from typing import Optional, List
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -14,11 +17,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
+import douyin_browser
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-app = FastAPI(title="Pro Media Downloader API", version="1.2.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """启动时预拉常驻 Chromium，避免第一个解析请求承担冷启动开销"""
+    try:
+        browser = await douyin_browser.get_browser()
+        await browser.warmup()
+    except Exception as exc:
+        print(f"[startup] 浏览器预热失败（首个解析请求会重试）: {type(exc).__name__}: {exc}", flush=True)
+    yield
+    try:
+        await douyin_browser.close_browser()
+    except Exception:
+        pass
+
+
+app = FastAPI(title="Pro Media Downloader API", version="1.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,44 +50,76 @@ app.add_middleware(
 
 PROXY_URL = os.getenv("PROXY_URL") or None
 
+# 实况照片静帧的 JPEG 编码参数（画质优先，体积不管）
+#   源图是抖音的 ~tplv-dy-aweme-images:q75.webp（有损，2160x2880，已是可拿到的最高分辨率；
+#   去掉 tplv 变换求原图会 403，换 q100/origin/heic 等规格也 403，签名覆盖了变换段），
+#   所以重编码阶段的目标是「不再额外丢东西」：
+#     - quality=95 → 98：相对源图的重编码失真 PSNR 47.6dB → 50.2dB（实测）
+#     - subsampling=0（4:4:4）：默认 4:2:0 会把色度分辨率减半，开启后色度不丢
+#   实注：Pillow 的 subsampling=0 必须显式传，否则 quality>=95 仍可能走 4:2:0。
+#   想压体积可设 LIVE_JPEG_QUALITY=85（约省一半，画质肉眼看不出差别）。
+LIVE_JPEG_QUALITY = int(os.getenv("LIVE_JPEG_QUALITY", "98"))
+
 def random_str(length=16):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-async def fetch_douyin_data(item_id: str, max_retries: int = 3):
-    """带自动注册 ttwid 与动态凭据的抖音详情抓取器（强制直连 trust_env=False）"""
+# ----------------------------------------------------------------------------
+# 抖音详情抓取
+#
+# 2026-10-10 起，抖音 web 详情接口对匿名裸 HTTP 请求一律返回
+#   403 Blocked by ArgusSecurityPlugin Uifid Not Found
+# ttwid 已不再被认可（注册接口仍返回 200，但 detail 接口照样拒绝）。
+# 因此改为通过常驻 headless Chromium 打开作品页、直接取页面自身发出的 detail
+# 响应 —— 只有真实浏览器会话携带的 secsdk 凭据（UIFID/UIFID_TEMP、odin_tt、
+# __ac_signature 等）能通过校验。实现见 douyin_browser.py。
+# ----------------------------------------------------------------------------
+
+# 解析结果短缓存：手机脚本逐张保存实况时会用同一个分享链接反复调用
+# /api/live_photo_bundle?url=...&index=N（每次都要重新解析作品，3s+）。
+# 缓存后第 2..N 张只剩下载 + 打包的开销。作品内容不会变，15 分钟 TTL 足够安全。
+_DETAIL_TTL = float(os.getenv("DOUYIN_DETAIL_TTL", "900"))
+_DETAIL_CACHE_MAX = 128
+_DETAIL_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+
+
+def _detail_cache_get(item_id: str):
+    ent = _DETAIL_CACHE.get(item_id)
+    if not ent:
+        return None
+    ts, detail = ent
+    if time.time() - ts > _DETAIL_TTL:
+        _DETAIL_CACHE.pop(item_id, None)
+        return None
+    _DETAIL_CACHE.move_to_end(item_id)
+    return detail
+
+
+def _detail_cache_put(item_id: str, detail: dict) -> None:
+    _DETAIL_CACHE[item_id] = (time.time(), detail)
+    _DETAIL_CACHE.move_to_end(item_id)
+    while len(_DETAIL_CACHE) > _DETAIL_CACHE_MAX:
+        _DETAIL_CACHE.popitem(last=False)
+
+
+async def fetch_douyin_data(item_id: str, is_note: bool = False, max_retries: int = 3):
+    """通过常驻浏览器会话取 aweme_detail（含实况 MOV 与多档 bit_rate）"""
+    cached = _detail_cache_get(item_id)
+    if cached:
+        return cached
+
+    browser = await douyin_browser.get_browser()
+    last_err = None
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(trust_env=False, follow_redirects=True, timeout=10.0) as client:
-                reg_resp = await client.post('https://ttwid.bytedance.com/ttwid/union/register/', json={
-                    'region': 'cn', 'aid': 1768, 'needFid': 'false', 'service': 'www.ixigua.com',
-                    'migrate_info': {'ticket': '', 'source': 'node'}, 'cbUrlProtocol': 'https', 'union': 'true'
-                })
-                ttwid = reg_resp.cookies.get('ttwid', '')
-
-                headers = {
-                    'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(120, 128)}.0.0.0 Safari/537.36',
-                    'Referer': f'https://www.douyin.com/video/{item_id}',
-                    'Cookie': f'ttwid={ttwid}; s_v_web_id=verify_{random_str(8)}; passport_csrf_token={random_str(32)};',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                    'Sec-Ch-Ua': '\"Chromium\";v=\"128\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"128\"',
-                    'Sec-Ch-Ua-Mobile': '?0',
-                    'Sec-Ch-Ua-Platform': '\"Windows\"',
-                    'Sec-Fetch-Dest': 'empty',
-                    'Sec-Fetch-Mode': 'cors',
-                    'Sec-Fetch-Site': 'same-origin',
-                }
-
-                url = f'https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={item_id}&aid=6383&device_platform=webapp'
-                resp = await client.get(url, headers=headers)
-                
-                if resp.status_code == 200 and resp.text.startswith('{'):
-                    data = resp.json()
-                    if data.get('aweme_detail'):
-                        return data.get('aweme_detail')
-        except Exception:
-            pass
-        time.sleep(0.3)
+            detail = await browser.get_detail(item_id)
+            if detail:
+                _detail_cache_put(item_id, detail)
+                return detail
+            last_err = "浏览器返回空详情"
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+        await asyncio.sleep(0.5 * (attempt + 1))
+    print(f"[douyin] fetch_douyin_data({item_id}) 失败: {last_err}", flush=True)
     return None
 
 def get_clean_base_url(request: Request) -> str:
@@ -95,18 +147,30 @@ async def extract_douyin(raw_input: str, base_url: str):
         resp = await client.get(share_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
         final_url = str(resp.url)
 
-        item_id_match = re.search(r'/(?:video|note)/(\d+)', final_url)
+        # 支持多种链接格式: /video/xxx /note/xxx /share/slides/xxx /share/video/xxx modal_id=xxx
+        item_id_match = re.search(r'/(?:video|note|slides)/(\d+)', final_url)
         if not item_id_match:
             item_id_match = re.search(r'modal_id=(\d+)', final_url)
+        if not item_id_match:
+            # 兜底: 从原始分享链接提取（部分短链不重定向）
+            item_id_match = re.search(r'/(?:video|note|slides)/(\d+)', share_url)
+        if not item_id_match:
+            # 最终兜底: 提取任意 19 位数字 ID
+            item_id_match = re.search(r'(\d{19})', final_url) or re.search(r'(\d{19})', share_url)
 
         if not item_id_match:
             raise HTTPException(status_code=400, detail="无法提取抖音作品 ID，请检查链接是否有效")
 
         item_id = item_id_match.group(1)
+        # slides 一定是图文/实况，note 是图文
+        is_note = ("/note/" in final_url) or ("/slides/" in final_url) or ("/note/" in share_url) or ("/slides/" in share_url)
 
-        aweme_detail = await fetch_douyin_data(item_id)
+        aweme_detail = await fetch_douyin_data(item_id, is_note=is_note)
         if not aweme_detail:
-            raise HTTPException(status_code=502, detail="获取抖音作品详情失败，请稍后重试")
+            # 注意：状态码必须落在 4xx。Cloudflare 边缘会把 origin 的 5xx 正文重写成
+            # 纯文本 "error code: 502"，手机端就只能看到一句无信息量的错误；
+            # 4xx 会原样透传，detail 里的话才能读得到。
+            raise HTTPException(status_code=424, detail="上游解析失败：抖音详情接口被风控拦截或超时，请稍后重试（浏览器通道）")
 
         raw_title = aweme_detail.get("desc", f"douyin_{item_id}").strip() or f"douyin_{item_id}"
         clean_title = re.sub(r'[\\/*?:"<>|\r\n\t]', '_', raw_title)[:60]
@@ -129,31 +193,55 @@ async def extract_douyin(raw_input: str, base_url: str):
                 "download_url": music_dl
             }
 
-        # 判断是否为图文/图集
+        # 判断是否为图文/图集/实况图文 (Live Photo)
         images = aweme_detail.get("images")
+        is_live_work = aweme_detail.get("is_live_photo", False) or aweme_detail.get("media_type") == 42
         if images:
             medias = []
+            has_live_photo = False
             for idx, img in enumerate(images):
                 url_list = img.get("url_list", [])
-                if url_list:
-                    raw_img_url = url_list[0]
-                    proxy_dl = f"{base_url}api/download?media_url={urllib.parse.quote(raw_img_url)}&filename={urllib.parse.quote(clean_title + f'_图{idx+1}')}"
-                    proxy_stream = f"{base_url}api/stream?media_url={urllib.parse.quote(raw_img_url)}"
-                    medias.append({
-                        "index": idx + 1,
-                        "type": "image",
-                        "raw_url": raw_img_url,
-                        "stream_url": proxy_stream,
-                        "download_url": proxy_dl,
-                        "quality": "原始无损图"
-                    })
+                raw_img_url = url_list[0] if url_list else ""
+                
+                # 判定实况照片 (live_photo_type == 1 且包含配套短视频 video)
+                iv = img.get("video") or {}
+                is_live_img = (img.get("live_photo_type") == 1 and bool(iv)) or (is_live_work and bool(iv))
+                
+                raw_video_url = None
+                proxy_video_dl = None
+                if is_live_img:
+                    has_live_photo = True
+                    v_urls = (iv.get("play_addr") or {}).get("url_list") or (iv.get("download_addr") or {}).get("url_list") or []
+                    if v_urls:
+                        raw_video_url = v_urls[0].replace("playwm", "play")
+                        proxy_video_dl = f"{base_url}api/download?media_url={urllib.parse.quote(raw_video_url)}&filename={urllib.parse.quote(clean_title + f'_实况{idx+1}')}"
+
+                proxy_dl = f"{base_url}api/download?media_url={urllib.parse.quote(raw_img_url)}&filename={urllib.parse.quote(clean_title + f'_图{idx+1}')}"
+                proxy_stream = f"{base_url}api/stream?media_url={urllib.parse.quote(raw_img_url)}"
+                
+                media_item = {
+                    "index": idx + 1,
+                    "type": "live_photo" if is_live_img else "image",
+                    "is_live": is_live_img,
+                    "raw_url": raw_img_url,
+                    "stream_url": proxy_stream,
+                    "download_url": proxy_dl,
+                    "quality": "实况照片(图片+视频)" if is_live_img else "原始无损图"
+                }
+                if is_live_img and raw_video_url:
+                    media_item["raw_video_url"] = raw_video_url
+                    media_item["download_video_url"] = proxy_video_dl
+
+                medias.append(media_item)
 
             encoded_title = urllib.parse.quote(clean_title)
             zip_url = f"{base_url}api/download_zip?item_id={item_id}&filename={encoded_title}"
 
+            platform_title = "抖音实况图文" if has_live_photo else "抖音图文"
             return {
-                "platform": "抖音图文",
-                "type": "image",
+                "platform": platform_title,
+                "type": "live_photo" if has_live_photo else "image",
+                "has_live_photo": has_live_photo,
                 "item_id": item_id,
                 "title": clean_title,
                 "author": author,
@@ -332,19 +420,42 @@ async def api_shortcut(req: ShortcutRequest, request: Request):
     else:
         raise HTTPException(status_code=400, detail="不支持的链接格式")
 
-    download_urls = [m["download_url"] for m in res.get("medias", [])]
-    raw_urls = [m["raw_url"] for m in res.get("medias", [])]
+    raw_urls = []
+    download_urls = []
+    live_photos = []
+
+    for m in res.get("medias", []):
+        raw_urls.append(m["raw_url"])
+        download_urls.append(m["download_url"])
+        if m.get("is_live") and m.get("raw_video_url"):
+            live_photos.append({
+                "index": m["index"],
+                "image_url": m["raw_url"],
+                "video_url": m["raw_video_url"],
+                "download_image_url": m["download_url"],
+                "download_video_url": m["download_video_url"]
+            })
+            # 将实况附带的动态视频也作为媒体文件加入，确保普通快捷指令也能存入动起来的实况片段
+            raw_urls.append(m["raw_video_url"])
+            download_urls.append(m["download_video_url"])
 
     return {
         "success": True,
         "platform": res.get("platform"),
         "type": res.get("type"),
+        "has_live_photo": res.get("has_live_photo", False),
         "title": res.get("title"),
         "author": res.get("author"),
         "cover": res.get("cover"),
         "count": res.get("count"),
         "download_urls": download_urls,
-        "raw_urls": raw_urls
+        "raw_urls": raw_urls,
+        "live_photos": live_photos,
+        "medias": res.get("medias", []),
+        "headers": {
+            "Referer": "https://www.douyin.com/",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        }
     }
 
 # 高性能防盗链视频/图片流媒体代理（支持 Range 拖拽进度条）
@@ -371,7 +482,7 @@ async def api_stream(request: Request, media_url: str = Query(...)):
 
     async def stream_content():
         try:
-            async for chunk in resp.aiter_bytes(chunk_size=1024 * 128):
+            async for chunk in resp.aiter_bytes(chunk_size=1024 * 512):
                 yield chunk
         finally:
             await resp.aclose()
@@ -397,7 +508,7 @@ async def api_stream(request: Request, media_url: str = Query(...)):
 # 图文一键打包 ZIP 下载接口
 @app.get("/api/download_zip")
 async def api_download_zip(item_id: str = Query(...), filename: str = Query("images")):
-    aweme_detail = await fetch_douyin_data(item_id)
+    aweme_detail = await fetch_douyin_data(item_id, is_note=True)
     if not aweme_detail or not aweme_detail.get("images"):
         raise HTTPException(status_code=400, detail="未找到对应的图集内容")
 
@@ -447,7 +558,7 @@ async def api_download(media_url: str = Query(...), filename: str = Query("media
 
     async def stream_content():
         try:
-            async for chunk in resp.aiter_bytes(chunk_size=1024 * 128):
+            async for chunk in resp.aiter_bytes(chunk_size=1024 * 512):
                 yield chunk
         finally:
             await resp.aclose()
@@ -497,3 +608,157 @@ async def serve_index():
         return FileResponse(index_path)
     return HTMLResponse("<h1>Media Downloader API is Running</h1>")
 
+
+
+import uuid
+import tempfile
+import shutil
+import zipfile
+import subprocess
+from PIL import Image
+import imageio_ffmpeg
+from live_mov_builder import inject_live_photo_metadata
+
+def build_apple_live_photo_exif_app1(content_id: str) -> bytes:
+    """构建符合 Apple 官方规范的完整 EXIF APP1（IFD0 -> ExifIFD (0x8769) -> MakerNote (0x927C) -> Apple iOS 0x0011 ContentIdentifier）"""
+    # 1. 构造 Apple MakerNote (70 字节)
+    cid_bytes = (content_id + "\0").encode("ascii")  # 37 字节
+    pad = len(cid_bytes) % 2
+    mn_data_offset = 14 + 2 + 12 + 4  # 32 字节
+
+    mn = bytearray()
+    mn.extend(b"Apple iOS\x00\x00\x01MM")  # 14 字节头部
+    mn.extend((1).to_bytes(2, "big"))       # 1 个条目
+    mn.extend((0x0011).to_bytes(2, "big"))  # 0x0011 ContentIdentifier
+    mn.extend((2).to_bytes(2, "big"))       # type ASCII
+    mn.extend(len(cid_bytes).to_bytes(4, "big"))  # count 37
+    mn.extend(mn_data_offset.to_bytes(4, "big"))  # offset 32
+    mn.extend((0).to_bytes(4, "big"))       # next IFD = 0
+    mn.extend(cid_bytes)
+    if pad:
+        mn.append(0)
+
+    # 2. 构造规范的 TIFF 目录树：IFD0(0x8769 指向 ExifIFD) -> ExifIFD(0x927C 指向 MakerNote)
+    exif_ifd_offset = 26
+    maker_note_offset = 44
+
+    tiff = bytearray()
+    tiff.extend(b"MM")  # 大端序
+    tiff.extend((42).to_bytes(2, "big"))
+    tiff.extend((8).to_bytes(4, "big"))  # 指向 IFD0 偏移 8
+
+    # IFD0: 1 个条目 ExifOffset (0x8769)
+    tiff.extend((1).to_bytes(2, "big"))
+    tiff.extend((0x8769).to_bytes(2, "big"))  # tag 0x8769
+    tiff.extend((4).to_bytes(2, "big"))       # type LONG
+    tiff.extend((1).to_bytes(4, "big"))       # count 1
+    tiff.extend(exif_ifd_offset.to_bytes(4, "big"))  # 偏移 26
+    tiff.extend((0).to_bytes(4, "big"))       # next IFD = 0
+
+    # ExifIFD: 1 个条目 MakerNote (0x927C)
+    tiff.extend((1).to_bytes(2, "big"))
+    tiff.extend((0x927C).to_bytes(2, "big"))  # tag 0x927C
+    tiff.extend((7).to_bytes(2, "big"))       # type UNDEFINED
+    tiff.extend(len(mn).to_bytes(4, "big"))   # 70 字节
+    tiff.extend(maker_note_offset.to_bytes(4, "big"))  # 偏移 44
+    tiff.extend((0).to_bytes(4, "big"))       # next IFD = 0
+
+    # 放入 MakerNote 数据
+    tiff.extend(mn)
+
+    # 3. 封装为 JPEG APP1 (0xFFE1)
+    payload = b"Exif\x00\x00" + tiff
+    return b"\xFF\xE1" + (len(payload) + 2).to_bytes(2, "big") + payload
+
+@app.get("/api/live_photo_bundle")
+async def api_live_photo_bundle(url: str = Query(...), index: int = Query(1), request: Request = None):
+    """生成并打包带 Apple 官方实况元数据 (MakerNote 17 + QuickTime Identifier) 的 Live Photo ZIP 包"""
+    base_url = get_clean_base_url(request)
+    res = await extract_douyin(url, base_url)
+    medias = res.get("medias", [])
+    if not medias:
+        raise HTTPException(status_code=400, detail="未找到媒体内容")
+
+    idx = max(0, min(index - 1, len(medias) - 1))
+    target = medias[idx]
+
+    if not target.get("is_live") or not target.get("raw_video_url"):
+        raise HTTPException(status_code=400, detail="所选项目不是实况照片")
+
+    img_url = target["raw_url"]
+    vid_url = target["raw_video_url"]
+    asset_id = str(uuid.uuid4()).upper()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15",
+        "Referer": "https://www.douyin.com/"
+    }
+
+    async with httpx.AsyncClient(trust_env=False, timeout=30.0, follow_redirects=True) as client:
+        import asyncio as _aio
+        img_resp, vid_resp = await _aio.gather(
+            client.get(img_url, headers=headers),
+            client.get(vid_url, headers=headers),
+        )
+
+    if img_resp.status_code != 200 or vid_resp.status_code != 200:
+        raise HTTPException(status_code=424, detail="实况源文件下载失败（抖音 CDN 拒绝或过期），请重新解析")
+
+    temp_dir = tempfile.mkdtemp(prefix="lp_")
+    try:
+        raw_vid_path = os.path.join(temp_dir, "raw.mp4")
+        out_mov_path = os.path.join(temp_dir, "live.mov")
+
+        with open(raw_vid_path, "wb") as f:
+            f.write(vid_resp.content)
+
+        # 1. ffmpeg 只负责无损转封装为 QuickTime MOV（moov 放在文件末尾）
+        #    Apple 实况必需的 mdta content.identifier 与 mebx timed metadata 轨道
+        #    由 inject_live_photo_metadata 直接写入，不再用 ffmpeg -metadata。
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        remux_path = os.path.join(temp_dir, "remux.mov")
+        cmd = [
+            ffmpeg_exe, "-y", "-i", raw_vid_path,
+            "-c", "copy",
+            "-map_metadata", "-1",
+            "-f", "mov",
+            "-brand", "qt",
+            remux_path,
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        patched_mov = inject_live_photo_metadata(open(remux_path, "rb").read(), asset_id)
+        with open(out_mov_path, "wb") as mf:
+            mf.write(patched_mov)
+
+        # 2. 将静态图片转为标准 JPEG 并注入 Apple MakerNote 0x0011 (asset_id)
+        #    编码参数见 LIVE_JPEG_QUALITY：quality=98 + 4:4:4，重编码失真已趋近可忽略
+        im = Image.open(io.BytesIO(img_resp.content))
+        jpg_buf = io.BytesIO()
+        im.convert("RGB").save(
+            jpg_buf, format="JPEG",
+            quality=LIVE_JPEG_QUALITY, subsampling=0,
+            optimize=True, progressive=True,
+        )
+        raw_jpg = jpg_buf.getvalue()
+
+        app1 = build_apple_live_photo_exif_app1(asset_id)
+        final_jpg = raw_jpg[:2] + app1 + raw_jpg[2:]
+
+        # 3. 打包成轻量 ZIP
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_STORED) as z:
+            z.writestr("live.jpg", final_jpg)
+            with open(out_mov_path, "rb") as mf:
+                z.writestr("live.mov", mf.read())
+
+        zip_buf.seek(0)
+        clean_fn = re.sub(r'[\\/*?:"<>|\r\n\t]', "_", res.get("title", "live_photo")).strip()[:50]
+        encoded_fn = urllib.parse.quote(f"{clean_fn}_实况{index}.zip")
+
+        return StreamingResponse(
+            zip_buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_fn}"}
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)

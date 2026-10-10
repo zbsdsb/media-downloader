@@ -1,0 +1,29 @@
+[Unit]
+Description=Media Downloader (抖音/Instagram 解析 + 实况打包, 浏览器通道)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=zbs
+Group=zbs
+WorkingDirectory=/home/zbs/media-service
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/zbs
+Environment=DOUYIN_HEADLESS=1
+Environment=DOUYIN_PROFILE_DIR=/home/zbs/media-service/chrome_profile
+Environment=PLAYWRIGHT_BROWSERS_PATH=/home/zbs/.cache/ms-playwright
+ExecStart=/home/zbs/media-service/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088 --timeout-keep-alive 65
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+LimitNOFILE=65535
+# 内存护栏：整机 5.2G，服务典型占用 ~1.5G（Chromium 峰值 RSS 687MB）。
+# 超过 3G 开始回收页缓存，超过 4G 由 cgroup 杀掉本服务（Restart=always 自动拉起），
+# 避免突发把整台笔记本（含桌面会话）拖进 OOM。
+MemoryHigh=3G
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

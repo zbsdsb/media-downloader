@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .tmp/
+
+# 浏览器 profile（含抖音设备凭据 UIFID/ttwid，绝不能入库）
+chrome_profile/
